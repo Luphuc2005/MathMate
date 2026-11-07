@@ -1,0 +1,509 @@
+from datetime import datetime, timedelta, timezone
+import logging
+from uuid import UUID, uuid4
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, selectinload
+
+from app.assignments.models import (
+    Assignment,
+    AssignmentMaterialItem,
+    AssignmentMaterialItemConcept,
+    AssignmentMaterialItemProblemType,
+    StudentAssignment,
+    AssignmentStudentQuestion,
+    StudentAssignmentMaterialItem,
+)
+from app.assignments.scoring import recalculate_student_assignment_score
+from app.core.exceptions import ApplicationError
+from app.learning_evidence.models import (
+    LearningEvidenceConcept,
+    LearningEvidenceEvent,
+    LearningEvidenceProblemType,
+    LearningEvidenceSourceKind,
+)
+from app.learning_evidence.publisher import (
+    LearningEvidencePayload,
+    LearningEvidencePublisher,
+)
+from app.mastery.evidence import (
+    DeterministicMasteryEvidencePublisher,
+    WeightedConceptEvidence,
+    WeightedProblemTypeEvidence,
+)
+from app.math_solutions.models import (
+    EvaluationDecision,
+    EvaluationOverride,
+    SolutionAttempt,
+)
+from app.practice.models import EvaluationStatus
+from app.questions.models import Question
+from app.review.models import ReviewResult, ReviewSchedule
+from app.review.service import ReviewScheduleService
+
+logger = logging.getLogger(__name__)
+
+
+class MathSolutionEvidenceAdapter:
+    """Adapter bridging Math Solution evaluations to the append-only LearningEvidence ledger,
+    updating student mastery and spaced repetition schedules, while enforcing anti-double-counting."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+        self.publisher = LearningEvidencePublisher()
+        self.review_service = ReviewScheduleService(session)
+
+    def emit_evidence_for_decision(self, decision_id: UUID) -> LearningEvidenceEvent:
+        decision = self.session.get(EvaluationDecision, decision_id)
+        if decision is None:
+            raise ApplicationError(404, "DECISION_NOT_FOUND", "Evaluation decision not found.")
+
+        # Idempotency: if already linked, return existing event
+        if decision.learning_evidence_event_id is not None:
+            existing = self.session.get(LearningEvidenceEvent, decision.learning_evidence_event_id)
+            if existing is not None:
+                return existing
+
+        # Check by source entity ID in case of partial retry
+        existing_event = self.session.scalar(
+            select(LearningEvidenceEvent).where(
+                LearningEvidenceEvent.source_kind == LearningEvidenceSourceKind.MATH_SOLUTION_EVALUATION,
+                LearningEvidenceEvent.source_entity_id == decision.id,
+            )
+        )
+        if existing_event is not None:
+            decision.learning_evidence_event_id = existing_event.id
+            self.session.flush()
+            return existing_event
+
+        attempt = self.session.get(SolutionAttempt, decision.attempt_id)
+        if attempt is None:
+            raise ApplicationError(404, "ATTEMPT_NOT_FOUND", "Solution attempt not found.")
+
+        # 1. Resolve subject, classroom, teaching plan, assignment
+        subject_id: UUID | None = None
+        classroom_id: UUID | None = None
+        teaching_plan_id: UUID | None = None
+        assignment_id: UUID | None = attempt.assignment_id
+
+        if attempt.assignment_id:
+            assignment = self.session.get(Assignment, attempt.assignment_id)
+            if assignment:
+                subject_id = assignment.subject_id
+                classroom_id = assignment.classroom_id
+                teaching_plan_id = assignment.teaching_plan_id
+
+        concepts: list[WeightedConceptEvidence] = []
+        problem_types: list[WeightedProblemTypeEvidence] = []
+        difficulty: float = 0.5
+
+        if attempt.question_id:
+            question = self.session.scalar(
+                select(Question)
+                .options(
+                    selectinload(Question.concept_links),
+                    selectinload(Question.problem_type_links),
+                )
+                .where(Question.id == attempt.question_id)
+            )
+            if question is None:
+                raise ApplicationError(404, "QUESTION_NOT_FOUND", "Canonical question not found.")
+            if subject_id is None:
+                subject_id = question.subject_id
+            difficulty = question.difficulty if question.difficulty is not None else 0.5
+
+            for link in question.concept_links:
+                concepts.append(WeightedConceptEvidence(link.concept_id, link.weight))
+
+            for link in question.problem_type_links:
+                problem_types.append(
+                    WeightedProblemTypeEvidence(
+                        link.problem_type_id,
+                        link.weight if link.weight is not None else 1.0,
+                        is_primary=link.is_primary,
+                    )
+                )
+        elif attempt.assignment_material_item_id:
+            snapshot = self.session.get(AssignmentMaterialItem, attempt.assignment_material_item_id)
+            if snapshot:
+                difficulty = snapshot.difficulty if snapshot.difficulty is not None else 0.5
+
+            mat_concepts = list(
+                self.session.scalars(
+                    select(AssignmentMaterialItemConcept).where(
+                        AssignmentMaterialItemConcept.assignment_material_item_id
+                        == attempt.assignment_material_item_id
+                    )
+                )
+            )
+            for mc in mat_concepts:
+                concepts.append(WeightedConceptEvidence(mc.concept_id, mc.weight))
+
+            mat_pts = list(
+                self.session.scalars(
+                    select(AssignmentMaterialItemProblemType).where(
+                        AssignmentMaterialItemProblemType.assignment_material_item_id
+                        == attempt.assignment_material_item_id
+                    )
+                )
+            )
+            for i, mpt in enumerate(mat_pts):
+                problem_types.append(
+                    WeightedProblemTypeEvidence(
+                        mpt.problem_type_id,
+                        mpt.weight,
+                        is_primary=(i == 0),
+                    )
+                )
+
+        if subject_id is None:
+            raise ApplicationError(422, "SUBJECT_UNDETERMINED", "Cannot determine subject for attempt.")
+
+        occurred_at = decision.decided_at or datetime.now(timezone.utc)
+        response_time: float | None = None
+        if attempt.submitted_at and attempt.started_at:
+            response_time = max(1.0, (attempt.submitted_at - attempt.started_at).total_seconds())
+
+        # 2. Publish LearningEvidenceEvent
+        payload = LearningEvidencePayload(
+            student_id=attempt.student_id,
+            subject_id=subject_id,
+            classroom_id=classroom_id,
+            teaching_plan_id=teaching_plan_id,
+            assignment_id=assignment_id,
+            source_kind=LearningEvidenceSourceKind.MATH_SOLUTION_EVALUATION,
+            source_entity_id=decision.id,
+            is_correct=decision.is_correct,
+            score=decision.final_score,
+            difficulty=difficulty,
+            response_time_seconds=response_time,
+            hint_count=0,
+            evaluation_status=EvaluationStatus.EVALUATED,
+            occurred_at=occurred_at,
+            concepts=tuple(concepts),
+            problem_types=tuple(problem_types),
+            metadata={
+                "confirmed_misconceptions": decision.confirmed_misconceptions,
+                "decision_source": decision.decision_source,
+                "attempt_id": str(attempt.id),
+            },
+        )
+
+        evidence_event = self.publisher.publish(payload, self.session)
+        decision.learning_evidence_event_id = evidence_event.id
+        self.session.flush()
+
+        # Check if a prior provisional backdrop existed for this attempt; if so, resync mastery
+        prior_backdrops = list(
+            self.session.scalars(
+                select(LearningEvidenceEvent).where(
+                    LearningEvidenceEvent.source_kind == LearningEvidenceSourceKind.MATH_SOLUTION_EVALUATION,
+                    LearningEvidenceEvent.student_id == attempt.student_id,
+                )
+            )
+        )
+        has_prior_backdrop = any(
+            (ev.event_metadata or {}).get("attempt_id") == str(attempt.id)
+            and (ev.event_metadata or {}).get("review_source") == "ANSWER_GROUNDED_AI"
+            and ev.id != evidence_event.id
+            for ev in prior_backdrops
+        )
+        if has_prior_backdrop:
+            target_pts = {pt.problem_type_id for pt in problem_types}
+            target_cs = {c.concept_id for c in concepts}
+            DeterministicMasteryEvidencePublisher().recalculate_student_mastery(
+                self.session,
+                attempt.student_id,
+                problem_type_ids=target_pts,
+                concept_ids=target_cs,
+            )
+
+        # 3. Synchronize the one classroom item represented by this decision.
+        # The Assignment submission owns the transaction when commit=False.
+        if attempt.assignment_student_question_id:
+            asq = self.session.get(AssignmentStudentQuestion, attempt.assignment_student_question_id)
+            if asq is None:
+                raise ApplicationError(409, "GRADING_ASSIGNMENT_ITEM_MISSING", "Assigned question is missing.")
+            asq.score = decision.final_score
+            asq.is_correct = decision.is_correct
+            if asq.answered_at is None:
+                asq.answered_at = occurred_at
+        elif attempt.student_assignment_material_item_id:
+            smi = self.session.get(StudentAssignmentMaterialItem, attempt.student_assignment_material_item_id)
+            if smi is None:
+                raise ApplicationError(409, "GRADING_ASSIGNMENT_ITEM_MISSING", "Assigned material item is missing.")
+            smi.score = decision.final_score
+            smi.is_correct = decision.is_correct
+            smi.evaluation_status = EvaluationStatus.EVALUATED
+            smi.evaluation_details = {
+                "evaluation": "math_solution",
+                "decision_id": str(decision.id),
+            }
+            smi.graded_at = occurred_at
+            if smi.answered_at is None:
+                smi.answered_at = occurred_at
+
+        if attempt.student_assignment_id:
+            student_assignment = self.session.get(StudentAssignment, attempt.student_assignment_id)
+            if student_assignment is None:
+                raise ApplicationError(409, "GRADING_ASSIGNMENT_MISSING", "Student assignment is missing.")
+            recalculate_student_assignment_score(student_assignment, finalize=False)
+            self.session.flush()
+        # 4. Spaced repetition schedule (ReviewPolicy 2.0 days)
+        primary_pt = next((pt for pt in problem_types if pt.is_primary), None) or (
+            problem_types[0] if problem_types else None
+        )
+        if primary_pt:
+            schedule = self.session.scalar(
+                select(ReviewSchedule).where(
+                    ReviewSchedule.student_id == attempt.student_id,
+                    ReviewSchedule.problem_type_id == primary_pt.problem_type_id,
+                )
+            )
+            if schedule is None:
+                schedule = self.review_service.ensure_problem_type_schedule(
+                    attempt.student_id,
+                    primary_pt.problem_type_id,
+                    as_of=occurred_at,
+                    initial_interval_days=2.0,
+                )
+            schedule.review_interval_days = 2.0
+            schedule.next_review_at = occurred_at + timedelta(days=2.0)
+            schedule.last_review_result = (
+                ReviewResult.GOOD.value if decision.is_correct else ReviewResult.POOR.value
+            )
+            schedule.review_count += 1
+            self.session.flush()
+
+        try:
+            with self.session.begin_nested():
+                from app.planning.study_service import StudyPlanService
+                plan_svc = StudyPlanService(self.session)
+                pt_ids = [pt.problem_type_id for pt in problem_types]
+                c_ids = [c.concept_id for c in concepts]
+                plan_svc.complete_matching_tasks(
+                    attempt.student_id,
+                    problem_type_ids=pt_ids,
+                    concept_ids=c_ids,
+                    subject_id=subject_id,
+                    as_of=occurred_at.date(),
+                )
+                plan_svc.recalculate_study_plan(attempt.student_id, as_of=occurred_at.date())
+        except Exception:
+            logger.debug('Study plan update skipped after decision %s', decision.id, exc_info=True)
+
+        return evidence_event
+
+    def apply_teacher_override(
+        self,
+        decision_id: UUID,
+        teacher_id: UUID,
+        *,
+        new_score: float,
+        new_is_correct: bool,
+        reason: str,
+    ) -> EvaluationOverride:
+        decision = self.session.get(EvaluationDecision, decision_id)
+        if decision is None:
+            raise ApplicationError(404, "DECISION_NOT_FOUND", "Evaluation decision not found.")
+
+        current_max = (
+            self.session.scalar(
+                select(func.coalesce(func.max(EvaluationOverride.override_version), 0)).where(
+                    EvaluationOverride.decision_id == decision.id
+                )
+            )
+            or 0
+        )
+
+        override = EvaluationOverride(
+            id=uuid4(),
+            decision_id=decision.id,
+            teacher_id=teacher_id,
+            override_version=current_max + 1,
+            previous_score=decision.final_score,
+            new_score=new_score,
+            previous_is_correct=decision.is_correct,
+            new_is_correct=new_is_correct,
+            override_reason=reason,
+            projection_status="APPLIED",
+            created_at=datetime.now(timezone.utc),
+        )
+        self.session.add(override)
+
+        decision.final_score = new_score
+        decision.is_correct = new_is_correct
+        decision.decision_source = "TEACHER_REVIEW"
+
+        attempt = self.session.get(SolutionAttempt, decision.attempt_id)
+        if attempt:
+            attempt.total_score = new_score
+            attempt.is_correct = new_is_correct
+
+        # 1. Resolve subject, curriculum mappings, and difficulty for the append-only override evidence
+        subject_id = None
+        classroom_id = None
+        teaching_plan_id = None
+        assignment_id = attempt.assignment_id if attempt else None
+        difficulty = 0.5
+        concepts: list[WeightedConceptEvidence] = []
+        problem_types: list[WeightedProblemTypeEvidence] = []
+        response_time = None
+
+        if attempt:
+            if attempt.assignment_id:
+                assignment = self.session.get(Assignment, attempt.assignment_id)
+                if assignment:
+                    subject_id = assignment.subject_id
+                    classroom_id = assignment.classroom_id
+                    teaching_plan_id = assignment.teaching_plan_id
+            if attempt.submitted_at and attempt.started_at:
+                response_time = max(1.0, (attempt.submitted_at - attempt.started_at).total_seconds())
+
+            if attempt.question_id:
+                question = self.session.scalar(
+                    select(Question)
+                    .options(selectinload(Question.concept_links), selectinload(Question.problem_type_links))
+                    .where(Question.id == attempt.question_id)
+                )
+                if question:
+                    if subject_id is None:
+                        subject_id = question.subject_id
+                    difficulty = question.difficulty if question.difficulty is not None else 0.5
+                    for link in question.concept_links:
+                        concepts.append(WeightedConceptEvidence(link.concept_id, link.weight))
+                    for link in question.problem_type_links:
+                        problem_types.append(
+                            WeightedProblemTypeEvidence(
+                                link.problem_type_id,
+                                link.weight if link.weight is not None else 1.0,
+                                is_primary=link.is_primary,
+                            )
+                        )
+            elif attempt.assignment_material_item_id:
+                snapshot = self.session.get(AssignmentMaterialItem, attempt.assignment_material_item_id)
+                if snapshot and snapshot.difficulty is not None:
+                    difficulty = snapshot.difficulty
+                for mc in self.session.scalars(
+                    select(AssignmentMaterialItemConcept).where(
+                        AssignmentMaterialItemConcept.assignment_material_item_id == attempt.assignment_material_item_id
+                    )
+                ):
+                    concepts.append(WeightedConceptEvidence(mc.concept_id, mc.weight))
+                for idx, mpt in enumerate(self.session.scalars(
+                    select(AssignmentMaterialItemProblemType).where(
+                        AssignmentMaterialItemProblemType.assignment_material_item_id == attempt.assignment_material_item_id
+                    )
+                )):
+                    problem_types.append(
+                        WeightedProblemTypeEvidence(mpt.problem_type_id, mpt.weight, is_primary=(idx == 0))
+                    )
+
+        # 2. Append-only: Record a new LearningEvidenceEvent for the teacher override
+        if subject_id and attempt:
+            override_event = LearningEvidenceEvent(
+                student_id=attempt.student_id,
+                subject_id=subject_id,
+                classroom_id=classroom_id,
+                teaching_plan_id=teaching_plan_id,
+                assignment_id=assignment_id,
+                source_kind=LearningEvidenceSourceKind.MATH_SOLUTION_EVALUATION,
+                source_entity_id=override.id,
+                is_correct=new_is_correct,
+                score=new_score,
+                difficulty=difficulty,
+                response_time_seconds=response_time,
+                hint_count=0,
+                evaluation_status=EvaluationStatus.EVALUATED,
+                occurred_at=override.created_at,
+                event_metadata={
+                    "attempt_id": str(attempt.id),
+                    "decision_id": str(decision.id),
+                    "override_id": str(override.id),
+                    "override_version": override.override_version,
+                    "teacher_id": str(teacher_id),
+                    "previous_score": override.previous_score,
+                    "previous_is_correct": override.previous_is_correct,
+                    "reason": reason,
+                    "decision_source": "TEACHER_REVIEW",
+                },
+            )
+            self.session.add(override_event)
+            self.session.flush()
+
+            self.session.add_all([
+                LearningEvidenceProblemType(
+                    event_id=override_event.id,
+                    problem_type_id=pt.problem_type_id,
+                    weight=pt.weight,
+                    is_primary=pt.is_primary,
+                )
+                for pt in problem_types
+            ])
+            self.session.add_all([
+                LearningEvidenceConcept(
+                    event_id=override_event.id,
+                    concept_id=c.concept_id,
+                    weight=c.weight,
+                )
+                for c in concepts
+            ])
+            self.session.flush()
+            decision.learning_evidence_event_id = override_event.id
+
+            # 3. Synchronize classroom assigned items
+            if attempt.assignment_student_question_id:
+                asq = self.session.get(AssignmentStudentQuestion, attempt.assignment_student_question_id)
+                if asq:
+                    asq.score = new_score
+                    asq.is_correct = new_is_correct
+            elif attempt.student_assignment_material_item_id:
+                smi = self.session.get(StudentAssignmentMaterialItem, attempt.student_assignment_material_item_id)
+                if smi:
+                    smi.score = new_score
+                    smi.is_correct = new_is_correct
+                    smi.evaluation_status = EvaluationStatus.EVALUATED
+            if attempt.student_assignment_id:
+                sa = self.session.get(StudentAssignment, attempt.student_assignment_id)
+                if sa:
+                    recalculate_student_assignment_score(sa, finalize=False)
+
+            # 4. Deterministic Mastery Recalculation: replay active events, using latest override per attempt
+            target_pt_ids = {pt.problem_type_id for pt in problem_types}
+            target_concept_ids = {c.concept_id for c in concepts}
+            if target_pt_ids or target_concept_ids:
+                DeterministicMasteryEvidencePublisher().recalculate_student_mastery(
+                    self.session,
+                    attempt.student_id,
+                    problem_type_ids=target_pt_ids,
+                    concept_ids=target_concept_ids,
+                )
+
+            # 5. Update spaced repetition schedule for primary problem type
+            if target_pt_ids:
+                primary_pt_id = next(iter(target_pt_ids))
+                schedule = self.session.scalar(
+                    select(ReviewSchedule).where(
+                        ReviewSchedule.student_id == attempt.student_id,
+                        ReviewSchedule.problem_type_id == primary_pt_id,
+                    )
+                )
+                if schedule:
+                    schedule.last_review_result = (
+                        ReviewResult.GOOD.value if new_is_correct else ReviewResult.POOR.value
+                    )
+
+            # 6. Recalculate adaptive study plan
+            try:
+                with self.session.begin_nested():
+                    from app.planning.study_service import StudyPlanService
+                    StudyPlanService(self.session).recalculate_study_plan(attempt.student_id)
+            except Exception:
+                logger.debug(
+                    "Study plan recalculation skipped after teacher override %s",
+                    override.id,
+                    exc_info=True,
+                )
+
+        self.session.flush()
+        return override
