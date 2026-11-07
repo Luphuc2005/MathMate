@@ -1,0 +1,77 @@
+# Local configuration (keep the example files)
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Node / Next.js
+node_modules/
+.next/
+.next-*/
+out/
+*.tsbuildinfo
+npm-debug.log*
+
+# Editors / operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.log
+
+# Local build/download workspace
+.tmp/
+*.sql
+backend/var/
+*.db
+*.sqlite
+*.sqlite3
+*.zip
+*.backend-draft.json
+artifacts/
+*.png
+*.jpg
+*.jpeg
+
+# Graphify: development-only generated graph and machine-specific Codex config
+/graphify-out/
+/.codex/config.toml
+/.codex/hooks.json.bak*
+
+# Local academic handoff and generated review exports; acquire separately.
+# Keep the small, versioned backend/data/dev_only test pack in Git.
+/backend/data/Toan12_200_cau_20261104/
+/backend/data/content.draft.pretty.json
+/backend/data/questions/math/grade12/pdf_handoff_200_v0_1/
+/backend/data/materials/
+/reports/data_audits/
+/reports/derivative_step_review_10/
+/backend/app/seed_derivative_material_pack.py
+
+# Local recording helpers contain machine/account-specific configuration.
+/scripts/record_full_demo.mjs
+/scripts/convert_to_mp4.py
+/videos_recorded/
+*.webm
+*.mp4
+*.dump
+~$*
+.test-build*/
+*.onnx
+*.safetensors
+
+# Local worktrees/model caches are never distributable application source.
+.worktrees/
+*.gguf
+*.pdiparams
+*.pth
