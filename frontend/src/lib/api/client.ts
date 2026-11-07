@@ -1,0 +1,389 @@
+import type {
+  AttemptMutationToken,
+  AIReviewRead,
+  AIReviewAvailabilityRead,
+  ConceptMasteryRead,
+  InkDocumentRead,
+  InkPageRead,
+  InkPageWrite,
+  InkSaveRead,
+  MathAttemptsPageRead,
+  LoginRequest,
+  ProblemRead,
+  PracticeSessionStartRead,
+  ProblemTypeMasteryRead,
+  RefreshRequest,
+  SolutionAttemptRead,
+  StudentLearningStateRead,
+  StudentMasteryRead,
+  TokenPair,
+  UserRead,
+} from "./contracts";
+import {
+  parseAIReviewRead,
+  parseAIReviewAvailabilityRead,
+  parseConceptMastery,
+  parseInkDocumentRead,
+  parseInkPageRead,
+  parseInkSaveRead,
+  parseMathAttemptsPageRead,
+  parseOCRRecognizeResponse,
+  parseProblemRead,
+  parsePracticeSessionStartRead,
+  parseProblemTypeMastery,
+  parseSolutionAttemptRead,
+  parseStudentLearningState,
+  parseStudentMastery,
+  parseTokenPair,
+  parseUserRead,
+  validateLoginRequest,
+  OCRRecognizeRequest,
+  OCRRecognizeResponse,
+  StepMutationRequest,
+} from "./contracts";
+import { ApiContractError, array, boolean, integer, record, string } from "./validation";
+
+export interface PaperAttachmentRead {
+  id: string;
+  file_name: string;
+  content_type: "image/png" | "image/jpeg" | "application/pdf";
+  size_bytes: number;
+  sha256: string;
+  created_at: string;
+}
+
+export interface PaperOcrSuggestion {
+  page_number: number;
+  kind: "FORMULA" | "TEXT" | "TABLE";
+  text: string;
+  uncertain: boolean;
+  box_2d?: [number, number, number, number] | null;
+}
+
+export interface PaperOcrRead {
+  paper_id: string;
+  file_sha256: string;
+  provider: "GEMINI";
+  suggestions: PaperOcrSuggestion[];
+}
+
+function parsePaperOcr(value: unknown, path = "paper_ocr"): PaperOcrRead {
+  const row = record(value, path);
+  if (row.provider !== "GEMINI") throw new ApiContractError("Unsupported paper OCR provider", `${path}.provider`);
+  return {
+    paper_id: string(row.paper_id, `${path}.paper_id`),
+    file_sha256: string(row.file_sha256, `${path}.file_sha256`),
+    provider: "GEMINI",
+    suggestions: array(row.suggestions, `${path}.suggestions`, (value, itemPath) => {
+      const item = record(value, itemPath);
+      if (!["FORMULA", "TEXT", "TABLE"].includes(item.kind as string)) {
+        throw new ApiContractError("Unsupported OCR suggestion kind", `${itemPath}.kind`);
+      }
+      return {
+        page_number: integer(item.page_number, `${itemPath}.page_number`),
+        kind: item.kind as PaperOcrSuggestion["kind"],
+        text: string(item.text, `${itemPath}.text`),
+        uncertain: boolean(item.uncertain, `${itemPath}.uncertain`),
+        box_2d: Array.isArray(item.box_2d) && item.box_2d.length === 4
+          ? [Number(item.box_2d[0]), Number(item.box_2d[1]), Number(item.box_2d[2]), Number(item.box_2d[3])]
+          : null,
+      };
+    }),
+  };
+}
+
+function parsePaperAttachment(value: unknown, path = "paper"): PaperAttachmentRead {
+  const row = record(value, path);
+  const contentType = string(row.content_type, `${path}.content_type`);
+  if (!["image/png", "image/jpeg", "application/pdf"].includes(contentType)) {
+    throw new ApiContractError("Unsupported paper type", `${path}.content_type`);
+  }
+  return {
+    id: string(row.id, `${path}.id`), file_name: string(row.file_name, `${path}.file_name`),
+    content_type: contentType as PaperAttachmentRead["content_type"],
+    size_bytes: integer(row.size_bytes, `${path}.size_bytes`),
+    sha256: string(row.sha256, `${path}.sha256`),
+    created_at: string(row.created_at, `${path}.created_at`),
+  };
+}
+
+export type ApiErrorCategory = "unauthorized" | "forbidden" | "not_found" | "conflict" | "validation" | "unavailable" | "http";
+export interface ApiErrorEnvelope { error: { code: string; message: string; details?: unknown } }
+
+export class ApiResponseError extends Error {
+  constructor(message: string, public readonly status: number, public readonly code: string, public readonly category: ApiErrorCategory, public readonly details?: unknown) {
+    super(message);
+    this.name = "ApiResponseError";
+  }
+}
+
+export class ApiNetworkError extends Error {
+  constructor(message: string, public readonly cause?: unknown) {
+    super(message);
+    this.name = "ApiNetworkError";
+  }
+}
+
+export const API_PATHS = {
+  login: "/auth/login",
+  refresh: "/auth/refresh",
+  me: "/auth/me",
+  studentLearningState: "/students/me/learning-state",
+  studentMastery: "/students/me/mastery",
+  studentProblemTypeMastery: (id: string) => `/students/me/mastery/problem-types/${encodeURIComponent(id)}`,
+  studentConceptMastery: (id: string) => `/students/me/mastery/concepts/${encodeURIComponent(id)}`,
+  mathAttempts: "/api/v2/math-solutions/attempts",
+  practiceSessions: "/practice/sessions",
+  mathPracticeNextProblem: (id: string) => `/api/v2/math-solutions/practice-sessions/${encodeURIComponent(id)}/next-problem`,
+  mathAttempt: (id: string) => `/api/v2/math-solutions/attempts/${encodeURIComponent(id)}`,
+  mathAttemptProblem: (id: string) => `/api/v2/math-solutions/attempts/${encodeURIComponent(id)}/problem`,
+  mathAttemptSubmit: (id: string) => `/api/v2/math-solutions/attempts/${encodeURIComponent(id)}/submit`,
+  mathAttemptAIReview: (id: string) => `/api/v3/math-solutions/attempts/${encodeURIComponent(id)}/ai-review`,
+  mathPaper: (id: string) => `/api/v3/math-solutions/attempts/${encodeURIComponent(id)}/paper`,
+  mathPaperFile: (id: string, paperId: string) => `/api/v3/math-solutions/attempts/${encodeURIComponent(id)}/paper/${encodeURIComponent(paperId)}`,
+  mathPaperOcr: (id: string, paperId: string) => `/api/v3/math-solutions/attempts/${encodeURIComponent(id)}/paper/${encodeURIComponent(paperId)}/ocr`,
+  mathAttemptSteps: (id: string) => `/api/v2/math-solutions/attempts/${encodeURIComponent(id)}/steps`,
+  mathAttemptStepUpdate: (attemptId: string, stepId: string) =>
+    `/api/v2/math-solutions/attempts/${encodeURIComponent(attemptId)}/steps/${encodeURIComponent(stepId)}`,
+  mathAttemptStepDelete: (attemptId: string, stepId: string) =>
+    `/api/v2/math-solutions/attempts/${encodeURIComponent(attemptId)}/steps/${encodeURIComponent(stepId)}/delete`,
+  mathInkDocument: (id: string) => `/api/v2/math-solutions/attempts/${encodeURIComponent(id)}/ink`,
+  mathInkPage: (id: string, pageIndex: number) => `/api/v2/math-solutions/attempts/${encodeURIComponent(id)}/ink/pages/${pageIndex}`,
+  mathOcrRecognize: (id: string) => `/api/v2/math-solutions/attempts/${encodeURIComponent(id)}/ocr/recognize`,
+} as const;
+
+type ResponseParser<T> = (value: unknown, path?: string) => T;
+type Fetcher = typeof fetch;
+export interface ApiClientOptions { baseUrl: string; fetcher?: Fetcher }
+
+function statusCategory(status: number): ApiErrorCategory {
+  if (status === 401) return "unauthorized";
+  if (status === 403) return "forbidden";
+  if (status === 404) return "not_found";
+  if (status === 409) return "conflict";
+  if (status === 422) return "validation";
+  if (status === 503) return "unavailable";
+  return "http";
+}
+
+function parseErrorEnvelope(value: unknown): ApiErrorEnvelope | null {
+  try {
+    const outer = record(value, "error_response");
+    const detail = record(outer.error, "error_response.error");
+    let details: unknown;
+    if (detail.details !== undefined && detail.details !== null) {
+      if (!Array.isArray(detail.details)) throw new ApiContractError("Expected validation issue array", "error_response.error.details");
+      details = detail.details.map((item, index) => {
+        const issue = record(item, `error_response.error.details[${index}]`);
+        return { field: string(issue.field, `error_response.error.details[${index}].field`), message: string(issue.message, `error_response.error.details[${index}].message`) };
+      });
+    }
+    return { error: { code: string(detail.code, "error_response.error.code"), message: string(detail.message, "error_response.error.message"), ...(details === undefined ? {} : { details }) } };
+  } catch {
+    return null;
+  }
+}
+
+export function normalizeApiBaseUrl(value: string): string {
+  const url = new URL(value);
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) throw new Error("API_BASE_URL must be an HTTP(S) URL without credentials.");
+  if (url.pathname !== "/" || url.search || url.hash) throw new Error("API_BASE_URL must contain only the origin; canonical API paths are root paths.");
+  return url.origin;
+}
+
+export function getBackendBaseUrl(): string {
+  const value = process.env.API_BASE_URL ?? process.env.NEXT_PUBLIC_API_BASE_URL;
+  if (!value) throw new Error("API_BASE_URL is not configured.");
+  return normalizeApiBaseUrl(value);
+}
+
+export function createApiClient({ baseUrl, fetcher = fetch }: ApiClientOptions) {
+  const origin = normalizeApiBaseUrl(baseUrl);
+
+  async function request<T>(path: string, parser: ResponseParser<T>, init: RequestInit = {}, accessToken?: string): Promise<T> {
+    if (!path.startsWith("/") || path.startsWith("/api/v1")) throw new Error(`Non-canonical API path: ${path}`);
+    const headers = new Headers(init.headers);
+    headers.set("Accept", "application/json");
+    if (init.body !== undefined && !(init.body instanceof FormData)) headers.set("Content-Type", "application/json");
+    if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
+    let response: Response;
+    try {
+      response = await fetcher(`${origin}${path}`, { ...init, headers, cache: "no-store" });
+    } catch (error) {
+      throw new ApiNetworkError("Không thể kết nối tới EduMS API.", error);
+    }
+    let body: unknown = null;
+    const raw = await response.text();
+    if (raw) {
+      try { body = JSON.parse(raw) as unknown; }
+      catch { if (response.ok) throw new ApiContractError("Expected a JSON response"); }
+    }
+    if (!response.ok) {
+      const envelope = parseErrorEnvelope(body);
+      throw new ApiResponseError(envelope?.error.message ?? "EduMS API trả về lỗi không hợp lệ.", response.status, envelope?.error.code ?? "HTTP_ERROR", statusCategory(response.status), envelope?.error.details);
+    }
+    return parser(body);
+  }
+
+  return {
+    login(input: LoginRequest): Promise<TokenPair> {
+      return request(API_PATHS.login, parseTokenPair, { method: "POST", body: JSON.stringify(validateLoginRequest(input)) });
+    },
+    refresh(refreshToken: string): Promise<TokenPair> {
+      const body: RefreshRequest = { refresh_token: refreshToken };
+      return request(API_PATHS.refresh, parseTokenPair, { method: "POST", body: JSON.stringify(body) });
+    },
+    me(accessToken: string): Promise<UserRead> { return request(API_PATHS.me, parseUserRead, { method: "GET" }, accessToken); },
+    studentLearningState(accessToken: string, subjectId?: string): Promise<StudentLearningStateRead> {
+      const suffix = subjectId ? `?subject_id=${encodeURIComponent(subjectId)}` : "";
+      return request(`${API_PATHS.studentLearningState}${suffix}`, parseStudentLearningState, { method: "GET" }, accessToken);
+    },
+    studentMastery(accessToken: string): Promise<StudentMasteryRead> {
+      return request(API_PATHS.studentMastery, parseStudentMastery, { method: "GET" }, accessToken);
+    },
+    studentProblemTypeMastery(accessToken: string, problemTypeId: string): Promise<ProblemTypeMasteryRead> {
+      return request(API_PATHS.studentProblemTypeMastery(problemTypeId), parseProblemTypeMastery, { method: "GET" }, accessToken);
+    },
+    studentConceptMastery(accessToken: string, conceptId: string): Promise<ConceptMasteryRead> {
+      return request(API_PATHS.studentConceptMastery(conceptId), parseConceptMastery, { method: "GET" }, accessToken);
+    },
+    listMathAttempts(
+      accessToken: string,
+      query?: { page?: number; size?: number; status?: string }
+    ): Promise<MathAttemptsPageRead> {
+      return request(
+        `${API_PATHS.mathAttempts}?${(() => {
+          const page = query?.page && Number.isFinite(query.page) && query.page >= 1 ? Math.floor(query.page) : 1;
+          const size = query?.size && Number.isFinite(query.size) && query.size >= 1 && query.size <= 100 ? Math.floor(query.size) : 20;
+          const params = new URLSearchParams({ page: String(page), size: String(size) });
+          if (query?.status && query.status.trim().length > 0) params.set("status", query.status.trim());
+          return params.toString();
+        })()}`,
+        parseMathAttemptsPageRead,
+        { method: "GET" },
+        accessToken
+      );
+    },
+    createPracticeSession(accessToken: string, subjectId: string, options?: { problemTypeIds?: string[]; conceptIds?: string[]; sessionType?: string }): Promise<PracticeSessionStartRead> {
+      return request(API_PATHS.practiceSessions, parsePracticeSessionStartRead, {
+        method: "POST",
+        body: JSON.stringify({ subject_id: subjectId, session_type: options?.sessionType ?? "PRACTICE", problem_type_ids: options?.problemTypeIds ?? [], concept_ids: options?.conceptIds ?? [] }),
+      }, accessToken);
+    },
+    getMathPracticeNextProblem(accessToken: string, sessionId: string): Promise<ProblemRead> {
+      return request(API_PATHS.mathPracticeNextProblem(sessionId), parseProblemRead, { method: "GET" }, accessToken);
+    },
+    createMathAttempt(accessToken: string, sessionId: string, questionId: string): Promise<SolutionAttemptRead> {
+      return request(API_PATHS.mathAttempts, parseSolutionAttemptRead, {
+        method: "POST",
+        body: JSON.stringify({
+          source_kind: "CANONICAL",
+          context_type: "SELF_PRACTICE",
+          mode: "INDEPENDENT_SOLUTION",
+          create_idempotency_key: `student-workspace:${sessionId}`,
+          question_id: questionId,
+          practice_session_id: sessionId,
+        }),
+      }, accessToken);
+    },
+    getMathAttempt(accessToken: string, attemptId: string): Promise<SolutionAttemptRead> {
+      return request(API_PATHS.mathAttempt(attemptId), parseSolutionAttemptRead, { method: "GET" }, accessToken);
+    },
+    getMathAttemptProblem(accessToken: string, attemptId: string): Promise<ProblemRead> {
+      return request(API_PATHS.mathAttemptProblem(attemptId), parseProblemRead, { method: "GET" }, accessToken);
+    },
+    getMathInkDocument(accessToken: string, attemptId: string): Promise<InkDocumentRead> {
+      return request(API_PATHS.mathInkDocument(attemptId), parseInkDocumentRead, { method: "GET" }, accessToken);
+    },
+    getMathInkPage(accessToken: string, attemptId: string, pageIndex: number): Promise<InkPageRead> {
+      return request(API_PATHS.mathInkPage(attemptId, pageIndex), parseInkPageRead, { method: "GET" }, accessToken);
+    },
+    saveMathInkPage(accessToken: string, attemptId: string, pageIndex: number, payload: InkPageWrite): Promise<InkSaveRead> {
+      return request(
+        API_PATHS.mathInkPage(attemptId, pageIndex),
+        parseInkSaveRead,
+        { method: "PUT", body: JSON.stringify(payload) },
+        accessToken,
+      );
+    },
+    recognizeMathInk(accessToken: string, attemptId: string, payload: OCRRecognizeRequest): Promise<OCRRecognizeResponse> {
+      return request(
+        API_PATHS.mathOcrRecognize(attemptId),
+        parseOCRRecognizeResponse,
+        { method: "POST", body: JSON.stringify(payload) },
+        accessToken,
+      );
+    },
+    createMathStep(accessToken: string, attemptId: string, payload: StepMutationRequest): Promise<SolutionAttemptRead> {
+      return request(
+        API_PATHS.mathAttemptSteps(attemptId),
+        parseSolutionAttemptRead,
+        { method: "POST", body: JSON.stringify(payload) },
+        accessToken,
+      );
+    },
+    updateMathStep(accessToken: string, attemptId: string, stepId: string, payload: StepMutationRequest): Promise<SolutionAttemptRead> {
+      return request(API_PATHS.mathAttemptStepUpdate(attemptId, stepId), parseSolutionAttemptRead,
+        { method: "PATCH", body: JSON.stringify(payload) }, accessToken);
+    },
+    submitMathAttempt(accessToken: string, attemptId: string, payload: AttemptMutationToken): Promise<SolutionAttemptRead> {
+      return request(API_PATHS.mathAttemptSubmit(attemptId), parseSolutionAttemptRead,
+        { method: "POST", body: JSON.stringify(payload) }, accessToken);
+    },
+    getMathAIReviewAvailability(accessToken: string, attemptId: string): Promise<AIReviewAvailabilityRead> {
+      return request(API_PATHS.mathAttemptAIReview(attemptId), parseAIReviewAvailabilityRead,
+        { method: "GET" }, accessToken);
+    },
+    reviewMathAttempt(accessToken: string, attemptId: string): Promise<AIReviewRead> {
+      return request(API_PATHS.mathAttemptAIReview(attemptId), parseAIReviewRead,
+        { method: "POST" }, accessToken);
+    },
+    listMathPaper(accessToken: string, attemptId: string): Promise<PaperAttachmentRead[]> {
+      return request(API_PATHS.mathPaper(attemptId), (value) => array(value, "paper", parsePaperAttachment),
+        { method: "GET" }, accessToken);
+    },
+    uploadMathPaper(accessToken: string, attemptId: string, file: File): Promise<PaperAttachmentRead> {
+      const form = new FormData();
+      form.append("file", file, file.name);
+      return request(API_PATHS.mathPaper(attemptId), parsePaperAttachment,
+        { method: "POST", body: form }, accessToken);
+    },
+    deleteMathPaper(accessToken: string, attemptId: string, paperId: string): Promise<void> {
+      return request(API_PATHS.mathPaperFile(attemptId, paperId), () => undefined,
+        { method: "DELETE" }, accessToken);
+    },
+    recognizeMathPaper(accessToken: string, attemptId: string, paperId: string): Promise<PaperOcrRead> {
+      return request(API_PATHS.mathPaperOcr(attemptId, paperId), parsePaperOcr,
+        { method: "POST" }, accessToken);
+    },
+    deleteMathStep(accessToken: string, attemptId: string, stepId: string, payload: AttemptMutationToken): Promise<SolutionAttemptRead> {
+      return request(
+        API_PATHS.mathAttemptStepDelete(attemptId, stepId),
+        parseSolutionAttemptRead,
+        { method: "POST", body: JSON.stringify(payload) },
+        accessToken,
+      );
+    },
+  };
+}
+
+export type ApiClient = ReturnType<typeof createApiClient>;
+export function createBackendApiClient(): ApiClient { return createApiClient({ baseUrl: getBackendBaseUrl() }); }
+
+export type HealthResponse = { status: "ok" };
+export async function getHealth(signal?: AbortSignal): Promise<HealthResponse> {
+  let response: Response;
+  try {
+    response = await fetch(`${getBackendBaseUrl()}/health`, { headers: { Accept: "application/json" }, cache: "no-store", signal });
+  } catch (error) {
+    throw new ApiNetworkError("Không thể kết nối tới EduMS API.", error);
+  }
+  const body: unknown = await response.json().catch(() => null);
+  if (!response.ok) {
+    const envelope = parseErrorEnvelope(body);
+    throw new ApiResponseError(envelope?.error.message ?? "EduMS API trả về lỗi.", response.status, envelope?.error.code ?? "HTTP_ERROR", statusCategory(response.status), envelope?.error.details);
+  }
+  const source = record(body, "response");
+  if (source.status !== "ok") throw new ApiContractError("Expected status=ok", "response.status");
+  return { status: "ok" };
+}
