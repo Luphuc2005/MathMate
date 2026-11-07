@@ -1,0 +1,123 @@
+.atmosphere {
+  position: fixed;
+  inset: 0;
+  z-index: -3;
+  overflow: hidden;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 18% 12%, rgba(99, 201, 154, 0.16), transparent 38%),
+    radial-gradient(circle at 82% 24%, rgba(92, 169, 214, 0.14), transparent 42%),
+    radial-gradient(circle at 50% 75%, rgba(133, 120, 207, 0.12), transparent 48%),
+    radial-gradient(circle at 75% 85%, rgba(244, 209, 125, 0.08), transparent 35%),
+    linear-gradient(180deg, #f9faf5 0%, #f3f6f1 45%, #ecf2eb 100%);
+}
+
+:global([data-theme="dark"]) .atmosphere,
+.atmosphereDark {
+  background:
+    radial-gradient(circle at 18% 12%, rgba(99, 201, 154, 0.18), transparent 38%),
+    radial-gradient(circle at 82% 24%, rgba(92, 169, 214, 0.16), transparent 42%),
+    radial-gradient(circle at 50% 75%, rgba(133, 120, 207, 0.14), transparent 48%),
+    radial-gradient(circle at 75% 85%, rgba(244, 209, 125, 0.1), transparent 35%),
+    linear-gradient(180deg, #091712 0%, #0d211a 45%, #081410 100%);
+}
+
+/* Celestial Aurora Waves */
+.auroraWaveOne {
+  position: absolute;
+  top: -12%;
+  left: 2%;
+  width: 75%;
+  height: 480px;
+  border-radius: 50%;
+  opacity: 0.35;
+  background: radial-gradient(ellipse at center, rgba(99, 201, 154, 0.28) 0%, rgba(59, 185, 176, 0.15) 45%, transparent 70%);
+  animation: aurora-drift 28s ease-in-out infinite alternate;
+  filter: blur(35px);
+  will-change: transform;
+}
+
+.auroraWaveTwo {
+  position: absolute;
+  top: 18%;
+  right: -8%;
+  width: 65%;
+  height: 520px;
+  border-radius: 50%;
+  opacity: 0.28;
+  background: radial-gradient(ellipse at center, rgba(92, 169, 214, 0.24) 0%, rgba(133, 120, 207, 0.16) 48%, transparent 70%);
+  animation: aurora-drift-reverse 34s ease-in-out infinite alternate;
+  filter: blur(40px);
+  will-change: transform;
+}
+
+/* Floating Stardust Particles & Fireflies */
+.cosmicDust {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.cosmicParticle {
+  position: absolute;
+  border-radius: 50%;
+  will-change: transform, opacity;
+  animation: cosmic-float var(--particle-duration, 16s) var(--particle-delay, 0s) ease-in-out infinite;
+}
+
+.particleGold {
+  background: rgb(244, 209, 125);
+  box-shadow: 0 0 10px rgba(244, 209, 125, 0.8), 0 0 20px rgba(244, 209, 125, 0.4);
+}
+
+.particleMint {
+  background: rgb(99, 201, 154);
+  box-shadow: 0 0 10px rgba(99, 201, 154, 0.8), 0 0 20px rgba(99, 201, 154, 0.4);
+}
+
+.particleSky {
+  background: rgb(92, 169, 214);
+  box-shadow: 0 0 10px rgba(92, 169, 214, 0.8), 0 0 20px rgba(92, 169, 214, 0.4);
+}
+
+.particleViolet {
+  background: rgb(167, 139, 250);
+  box-shadow: 0 0 10px rgba(167, 139, 250, 0.8), 0 0 20px rgba(167, 139, 250, 0.4);
+}
+
+@keyframes cosmic-float {
+  0%, 100% {
+    transform: translate3d(0, 0, 0) scale(0.9);
+    opacity: 0.25;
+  }
+  30% {
+    transform: translate3d(14px, -24px, 0) scale(1.18);
+    opacity: 0.85;
+  }
+  65% {
+    transform: translate3d(-10px, -45px, 0) scale(1.05);
+    opacity: 0.55;
+  }
+  85% {
+    transform: translate3d(6px, -18px, 0) scale(0.95);
+    opacity: 0.4;
+  }
+}
+
+@keyframes aurora-drift {
+  0% { transform: translate3d(-4%, 0, 0) rotate(0deg) scale(0.95); }
+  100% { transform: translate3d(6%, 15px, 0) rotate(6deg) scale(1.08); }
+}
+
+@keyframes aurora-drift-reverse {
+  0% { transform: translate3d(4%, 0, 0) rotate(0deg) scale(1.04); }
+  100% { transform: translate3d(-5%, -18px, 0) rotate(-5deg) scale(0.96); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cosmicParticle,
+  .auroraWaveOne,
+  .auroraWaveTwo {
+    animation: none;
+  }
+}
