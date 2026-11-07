@@ -1,0 +1,93 @@
+"use server";
+
+import { redirect } from "next/navigation";
+
+import { resolveStepReviewExample, stepReviewSeedCommand } from "@/features/math-workspace/utils/step-review-examples";
+import { getWorkspaceSubjects } from "@/features/math-workspace/entry-service";
+import { ApiResponseError, createBackendApiClient } from "@/lib/api/client";
+import { requirePageRole } from "@/lib/auth/page-session";
+import { readAccessToken } from "@/lib/auth/server";
+
+export interface StartWorkspaceState {
+  error: string | null;
+}
+
+export async function startWorkspaceAction(
+  _previous: StartWorkspaceState,
+  formData: FormData,
+): Promise<StartWorkspaceState> {
+  await requirePageRole("STUDENT", "/student/attempts");
+  const accessToken = await readAccessToken();
+  if (!accessToken) return { error: "Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại." };
+
+  const requestedSubjectId = formData.get("subject_id");
+  if (typeof requestedSubjectId !== "string") return { error: "Vui lòng chọn môn học." };
+
+  let attemptId: string;
+  try {
+    const subjects = await getWorkspaceSubjects(accessToken);
+    const subject = subjects.find((item) => item.id === requestedSubjectId);
+    if (!subject) return { error: "Môn học này chưa được phát hành cho tài khoản của bạn." };
+
+    const client = createBackendApiClient();
+    const session = await client.createPracticeSession(accessToken, subject.id);
+    const problem = await client.getMathPracticeNextProblem(accessToken, session.id);
+    const attempt = await client.createMathAttempt(accessToken, session.id, problem.id);
+    attemptId = attempt.id;
+  } catch (error) {
+    if (error instanceof ApiResponseError) {
+      if (error.code === "NO_QUESTIONS_AVAILABLE" || error.code === "NO_AVAILABLE_QUESTION") {
+        return { error: "Môn này chưa có câu hỏi đã duyệt phù hợp để mở trang làm bài." };
+      }
+      if (error.code === "NO_PRESENTABLE_QUESTIONS" || error.code === "QUESTION_PRESENTATION_REVIEW_REQUIRED") {
+        return { error: "Các câu hỏi hiện có cần được đối chiếu bản gốc để sửa cách hiển thị công thức trước khi giao cho học sinh." };
+      }
+      if (error.code === "QUESTION_GROUP_NOT_SUPPORTED") {
+        return { error: "Hiện chỉ có nhóm câu hỏi; trang viết bài cá nhân chưa hỗ trợ dạng này." };
+      }
+      if (error.status === 401) return { error: "Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại." };
+      return { error: "Chưa thể bắt đầu bài làm. Vui lòng thử lại sau." };
+    }
+    return { error: "Không thể kết nối dịch vụ làm bài. Vui lòng thử lại." };
+  }
+  redirect(`/student/attempts/${attemptId}`);
+}
+
+/** Open an allowlisted source-backed exercise in local development only. */
+export async function startStepReviewDemoAction(
+  _previous: StartWorkspaceState,
+  formData: FormData,
+): Promise<StartWorkspaceState> {
+  if (process.env.NODE_ENV === "production") return { error: "Bài thử chỉ có trong môi trường development." };
+  const example = resolveStepReviewExample(formData.get("question_id"));
+  if (!example) return { error: "Vui lòng chọn một bài thử trong danh sách." };
+  const seedCommand = stepReviewSeedCommand(example.id);
+  await requirePageRole("STUDENT", "/student/attempts");
+  const accessToken = await readAccessToken();
+  if (!accessToken) return { error: "Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại." };
+  let attemptId: string;
+  try {
+    const subjects = await getWorkspaceSubjects(accessToken);
+    const math = subjects.find((subject) => subject.code === "MATH_G12");
+    if (!math) return { error: "Tài khoản chưa được phép học môn Toán 12." };
+    const client = createBackendApiClient();
+    const session = await client.createPracticeSession(accessToken, math.id);
+    const attempt = await client.createMathAttempt(
+      accessToken, session.id, example.id,
+    );
+    attemptId = attempt.id;
+    const review = await client.getMathAIReviewAvailability(accessToken, attempt.id);
+    if (!review.available || review.reason_code === "PROVISIONAL_WITHOUT_ANSWER") {
+      return { error: `Bài thử chưa có lời giải tham chiếu. Chạy ${seedCommand} trong backend rồi thử lại.` };
+    }
+  } catch (error) {
+    if (error instanceof ApiResponseError && error.status === 401) {
+      return { error: "Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại." };
+    }
+    if (error instanceof ApiResponseError && ["QUESTION_NOT_APPROVED", "NO_QUESTIONS_AVAILABLE", "GRADING_ANSWER_REQUIRED", "GRADING_SOURCE_MISMATCH"].includes(error.code ?? "")) {
+      return { error: `Bài thử chưa được cài. Chạy ${seedCommand} trong backend rồi thử lại.` };
+    }
+    return { error: "Không mở được bài thử chấm từng bước. Kiểm tra backend và bài mẫu development." };
+  }
+  redirect(`/student/attempts/${attemptId}`);
+}
