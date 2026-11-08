@@ -319,10 +319,10 @@ class MathSolutionService:
                 )
                 if approved is not None:
                     rubric_id = approved.id
-                else:
+                elif source_kind == "TEACHER_MATERIAL":
                     new_rubric = SolutionRubric(
-                        question_id=q.id if source_kind == "CANONICAL" else None,
-                        assignment_material_item_id=material_id if source_kind == "TEACHER_MATERIAL" else None,
+                        question_id=None,
+                        assignment_material_item_id=material_id,
                         rubric_version=1,
                         title="Tiêu chí chấm tự động EduMS",
                         criteria=[
@@ -576,6 +576,21 @@ class MathSolutionService:
             expected_attempt_revision=expected_attempt_revision, client_action_id=client_action_id,
             operation="SUBMIT", payload={}, callback=action)
 
+    def reopen(self, actor_user_id: UUID, attempt_id: UUID) -> dict[str, Any]:
+        try:
+            attempt = self._attempt(actor_user_id, attempt_id, lock=True)
+            if attempt.context_type == "CLASSROOM_ASSIGNMENT" and attempt.student_assignment_id is not None:
+                sa = self.session.get(StudentAssignment, attempt.student_assignment_id)
+                if sa is not None and sa.status in (StudentAssignmentStatus.SUBMITTED, StudentAssignmentStatus.GRADED):
+                    raise _fail(409, "ASSIGNMENT_ALREADY_SUBMITTED", "Assignment has already been submitted.")
+            attempt.status = "IN_PROGRESS"
+            attempt.submitted_at = None
+            self.session.commit()
+            return self._snapshot(attempt)
+        except Exception:
+            self.session.rollback()
+            raise
+
     def list_attempts(
         self,
         actor_user_id: UUID,
@@ -588,16 +603,15 @@ class MathSolutionService:
         status: str | None = None,
     ) -> dict[str, Any]:
         student = self._student(actor_user_id)
-        stmt = select(SolutionAttempt).where(
-            SolutionAttempt.student_id == student.id,
-            SolutionAttempt.hidden_at.is_(None),
-        )
+        stmt = select(SolutionAttempt).where(SolutionAttempt.student_id == student.id)
+        if student_assignment_id is not None:
+            stmt = stmt.where(SolutionAttempt.student_assignment_id == student_assignment_id)
+        else:
+            stmt = stmt.where(SolutionAttempt.hidden_at.is_(None))
         if question_id is not None:
             stmt = stmt.where(SolutionAttempt.question_id == question_id)
         if practice_session_id is not None:
             stmt = stmt.where(SolutionAttempt.practice_session_id == practice_session_id)
-        if student_assignment_id is not None:
-            stmt = stmt.where(SolutionAttempt.student_assignment_id == student_assignment_id)
         if status is not None:
             stmt = stmt.where(SolutionAttempt.status == status)
 
